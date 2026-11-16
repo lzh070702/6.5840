@@ -46,6 +46,7 @@ Server 维护一个内存中的 `map[string]kvEntry`，每个 entry 包含 `Valu
 |---|---|---|
 | `client.go` | 修改 | Clerk 的 `Put` / `Get` 实现：构造 RPC 参数、发送、处理重试 |
 | `server.go` | 修改 | 实现 `Put` / `Get` 的 RPC handler：维护 map + version，加锁，条件更新 |
+| `lock/lock.go` | 修改 | 基于 KV Server 的分布式锁：`Acquire` / `Release` |
 | `rpc/rpc.go` | 不修改 | RPC Args/Reply 结构，version 字段和错误值的定义 |
 | 测试文件 | 不修改 | 评分标准 |
 
@@ -151,3 +152,140 @@ Lab 2（Key/Value Server）没有一篇单独对应的“经典论文”。它�
 1. 先读 Lab 2 官方实验说明（`nil.csail.mit.edu/6.5840/labs/lab-kvsrv1.html` 或 `pdos.csail.mit.edu/6.824/labs/lab-kvsrv1.html`），重点是 Introduction 和 Duplicate detection 部分。
 2. 读线性一致性 FAQ（实验页面会链接），能用自己的话解释“为什么并发 Put/Get 必须等价于某个顺序执行”。
 3. 不需要读 Paxos/Raft 论文——那些是 Lab 3 的内容。Lab 2 的论文前置知识几乎是零，核心是工程上的去重设计。
+
+---
+
+## 第四部分：Lock（基于 KV Server 的分布式锁）
+
+前面的 KV Server 和 CAS 语义，最终落到 Lab 2 的第二个子任务：用 `Get` / `Put(version)` 实现一个分布式锁。它把 3.2 的版本号和条件写入用到了实际场景里。
+
+### 4.1 接口与语义
+
+`src/kvsrv1/lock/lock.go` 提供：
+
+- `MakeLock(ck, lockname) *Lock`：基于同一个 Clerk 创建一把命名锁；不同 `lockname` 的锁互相独立。
+- `Acquire()`：阻塞直到拿到锁；同一把锁在同一时刻只能有一个持有者。
+- `Release()`：释放自己持有的锁；不是持有者时应当是无害的，不能释放别人的锁。
+
+测试覆盖：
+
+- 单客户端 Acquire / Release；
+- 同一客户端同时持有两把不同名字的锁；
+- 多客户端争抢同一把锁，检查互斥；
+- 丢包网络下重复上述并发测试。
+
+### 4.2 用 KV 表示锁
+
+把锁的状态存在 KV Server 里：
+
+- key = `lockname`
+- value = 持有者的 token；空字符串 `""` 表示“空闲”
+- version = KV Server 维护的版本号
+
+每个 `Lock` 对象在创建时生成一个唯一 token（仓库里用 `kvtest.RandValue(8)`）。不要用固定字符串（比如 `"locked"`）作为 value：否则无法判断锁是不是自己的，也无法安全释放。
+
+### 4.3 Acquire：用 CAS 抢占
+
+```text
+Acquire():
+    loop:
+        val, ver, err = Get(lockname)
+        if err == ErrNoKey:
+            # 锁还不存在：用 version 0 创建
+            if Put(lockname, myToken, 0) == OK:
+                return
+        else if err == OK:
+            if val == myToken:
+                return              # 已经是自己持有
+            if val == "":
+                # 空闲：用当前 version 做 CAS
+                if Put(lockname, myToken, ver) == OK:
+                    return
+            # 否则被别人持有
+        sleep(10ms)                 # 退避，避免忙等
+```
+
+为什么这样能保证互斥：
+
+- 两个客户端可能同时读到“空闲 + 同一个 version”；它们都尝试 `Put(..., ver)`，但只有一个能成功，另一个收到 `ErrVersion`，回到 `Get` 重试。
+- 锁不存在时，两个客户端都可能尝试 `Put(..., 0)`；同样只有一个能创建成功。
+- `ErrMaybe` 不能当作失败放弃：写可能已经生效。循环回到 `Get`，如果看到 `val == myToken` 就返回，否则继续抢。
+- 只有 `Put` 返回 `OK`，或者 `Get` 看到 `val == myToken`，才返回。
+
+### 4.4 Release：只释放自己的锁
+
+```text
+Release():
+    loop:
+        val, ver, err = Get(lockname)
+        if err == ErrNoKey:
+            return                  # 没有锁可释放
+        if err == OK and val != myToken:
+            return                  # 不是持有者，什么都不做
+        if err == OK and val == myToken:
+            if Put(lockname, "", ver) == OK:
+                return
+        sleep(10ms)
+```
+
+关键点：
+
+- 先 `Get` 确认 value 是自己的 token，再用当前 version 做 CAS 写回 `""`。不能无条件 `Put`，否则可能释放别人的锁。
+- `Put` 返回 `ErrVersion` 说明期间锁被改了（正常竞争或自己的重试），回到 `Get` 重试。
+- `ErrMaybe` 同样回到 `Get`：如果 value 已经变成 `""`，说明释放成功；如果还是自己的 token，说明没释放成功，继续重试。
+- 释放后 key 仍然存在，value 为 `""`，version 继续增长；不要删除 key（本 Lab 也没有删除操作）。
+
+> 仓库里的 `Release` 在 `Get` 返回 `ErrNoKey` 时会继续循环；测试不会在未 Acquire 的情况下调用 Release，所以不会触发。更稳妥的写法是直接返回。
+
+### 4.5 测试与运行
+
+```bash
+cd ~/6.5840/src
+make lock1
+```
+
+`lock1` 会先编译 `src/main/kvsrv1d`，再跑 `lock/` 下的测试：
+
+| 测试 | 内容 |
+|---|---|
+| `TestReliableBasic` | 单客户端 Acquire / Release |
+| `TestReliableNested` | 同客户端两把不同名字的锁，验证独立性 |
+| `TestOneClientReliable` | 单客户端反复 Acquire / Release，临界区内检查共享 key |
+| `TestManyClientsReliable` | 10 个客户端争抢，验证互斥 |
+| `TestOneClientUnreliable` | 丢包网络下的单客户端 |
+| `TestManyClientsUnreliable` | 丢包网络下的多客户端争抢 |
+
+#### 测试在检查什么
+
+`oneClient` 的核心循环：
+
+1. 先创建两把锁 `lk1`、`lk2`，Acquire 两把锁，再分别 Release；
+2. 创建共享 key `"l0"`；
+3. 循环：
+   - `lk1.Acquire()`；
+   - `Get("l0")`，断言值为空——说明没有别的客户端同时在临界区；
+   - `Put("l0", 自己的 id, ver)`；
+   - sleep 10ms；
+   - `Put("l0", "", ver+1)`；
+   - `lk1.Release()`。
+
+如果互斥失败，两个客户端会同时看到 `"l0"` 为空并写入，后一个客户端再 `Get` 时就会读到非空值，测试报 `two clients acquired lock`。
+
+`TestReliableNested` 则验证：同一客户端先持有 `lk1` 再 Acquire `lk2` 不会死锁；两把锁的 key 不同，互不影响。
+
+### 4.6 常见坑
+
+| 症状 | 原因 | 修法 |
+|---|---|---|
+| 两个客户端同时拿到锁 | 用无条件 `Put`，或没带当前 version 做 CAS | 抢锁必须 `Put(..., ver)`；创建用 `Put(..., 0)` |
+| 释放了别人的锁 | Release 不检查 value 是不是自己的 token | 先 `Get`，确认 `val == myToken` 再 CAS 写 `""` |
+| 丢包测试卡住 | 把 `ErrMaybe` 当成失败，或者用旧 version 直接重试 | 回到 `Get`，按最新 value/version 决定 |
+| Acquire 忙等吃满 CPU | 循环里没有 sleep | 失败后 `sleep(10ms)` |
+| 版本号一直过期 | 缓存了旧 version，失败后继续用 | 每次 CAS 失败都重新 `Get` |
+| 不同锁互相阻塞 | 所有锁共用一个 key | key 用 `lockname`，不同名字独立 |
+| Acquire 返回但实际没拿到锁 | `Put` 返回 `ErrMaybe` 时直接 return | 只有 `Put` 返回 `OK`，或 `Get` 看到 `val == myToken`，才返回 |
+| 同一个 Lock 重复 Acquire | 没检查 value 是不是自己的 token | `Get` 到 `myToken` 直接返回 |
+
+### 4.7 与 KV Server 去重的关系
+
+Lock 不依赖 `Clerk.Put` 的 `ErrMaybe` 返回值来判断“成功还是失败”，而是把 `Put` 当成“可能成功的 CAS”：失败或不确定就重新 `Get`，根据 value / version 判断锁的状态。这样即使回复丢失，锁的状态仍然由 KV Server 的线性一致性保证。
