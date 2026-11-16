@@ -1,8 +1,8 @@
-# Lab 1: MapReduce 完整学习笔记
+# Lab 1: MapReduce 学习笔记
 
 ## 第一部分：这个 Lab 到底在干什么
 
-### 1.1 用一句话说
+### 1.1 一句话概括
 
 你要从零实现一个 MapReduce 分布式计算框架：一个 Coordinator 进程负责调度，多个 Worker 进程负责执行用户定义的 Map 和 Reduce 函数，最终把一堆输入文本处理成汇总结果。
 
